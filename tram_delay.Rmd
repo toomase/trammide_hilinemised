@@ -117,7 +117,7 @@ plot_tram_arrival <- function(tram_nr = "1"){
   
   # generate interactive plotly chart
   ggplotly(arrival_chart, 
-           height = 1500, width = 1000,  # chart size
+           height = 1500, width = 800,  # chart size
            tooltip = c("text")) %>%  # tooltip text
     # format legend position
     layout(legend = list(orientation = "h", x = 0.35, y = 1.04))
