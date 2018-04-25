@@ -1,0 +1,267 @@
+---
+title: "Prepare tram arrival data for analysis"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(lubridate)
+library(hms)
+library(sf)
+library(mapview)
+library(mapedit)
+library(leaflet)
+
+load("data/arrival_data.RData")
+load("data/tram_timetable.rData")
+load("data/tram_lines_sf.rData")
+```
+
+Load whole arrival data from API calls
+```{r}
+# fail path for all arrival data
+files = list.files("data/arrival", full.names = TRUE)
+
+# load arrival data into one dataframe
+system.time(
+  tram_arrival_raw <- map_df(files, readRDS)
+)
+```
+
+inspect arrival raw data
+```{r}
+glimpse(tram_arrival_raw)
+```
+
+Prepare arrival data so, that for every stop and tram there is one row (last) in table
+```{r}
+tram_arrival <- tram_arrival_raw %>% 
+  # remove duplicated rows
+  arrange(route_num, url, schedule_time_in_seconds, expected_time_in_seconds,
+          desc(timestamp)) %>%
+  distinct(route_num, url, schedule_time_in_seconds, expected_time_in_seconds,
+           .keep_all = TRUE) %>%
+  # concert to proper timestamp of API call
+  mutate(timestamp = as.POSIXct(timestamp, origin = "1970-01-01"),
+         scheduled_vs_expected = as.numeric(expected_time_in_seconds) - as.numeric(schedule_time_in_seconds),
+         expected_hms = as.hms(as.numeric(expected_time_in_seconds)),
+         schedule_hms = as.hms(as.numeric(schedule_time_in_seconds)),
+         # round down to minute
+         schedule_hms_round = as.hms(str_replace(schedule_hms, "[[:digit:]]{2}$", "00"))) %>% 
+  # add stop id
+  left_join(all_stop_id_url, by = c("url" = "api_url")) %>% 
+  # add stop name
+  left_join(peatused %>% as.tibble() %>% select(-geometry), by = c("id" = "SiriID")) %>% 
+  # arrival data for one 24H period
+  # remove trips to depoo
+  filter(timestamp >= dmy_hm("16.04.2018 01:00"),
+         timestamp <= dmy_hm("17.04.2018 01:00"),
+         !str_detect(stop_name, "depoo")) %>%
+  # for every stop and tram keep only last delay data
+  arrange(id, route_num, stop_name, schedule_time_in_seconds, desc(timestamp)) %>% 
+  distinct(id, route_num, stop_name, schedule_hms_round,
+           .keep_all = TRUE) %>% 
+  rename(last_stop = stop_name, stop = Name) %>% 
+  # format to proper time hh:mm
+  mutate(stop = as.character(stop)) %>% 
+  select(-url)
+
+glimpse(tram_arrival)
+```
+
+```{r}
+tram_timetable %>% 
+  glimpse()
+```
+
+Combine tram timetable data with actual arrival data
+```{r}
+tram_timetable_arrival <- tram_timetable %>% 
+  # round down to nearest minute to join datasets
+  mutate(schedule_hms_round = as.hms(str_c(str_c(time, ":00")))) %>% 
+  filter(last_stop != "Vineeri") %>% 
+  # remove duplicates for scheduled time
+  arrange(route_num, stop, last_stop, schedule_hms_round) %>% 
+  distinct(route_num, stop, last_stop, time, schedule_hms_round, .keep_all = TRUE) %>% 
+  # join arrival data
+  left_join(tram_arrival, by = c("route_num", "stop", "last_stop", "schedule_hms_round")) %>% 
+  arrange(url, schedule_hms_round) %>% 
+  select(-transport, -schedule_hms, -expected_time_in_seconds,
+         -schedule_time_in_seconds, -id) %>% 
+  # fill missin timestamp and scheduled_vs_expected columns based on last known value
+  group_by(url) %>% 
+  fill(timestamp, scheduled_vs_expected) %>% 
+  group_by(url) %>% 
+  fill(timestamp, scheduled_vs_expected, .direction = "up") %>% 
+  ungroup() %>% 
+  # if expected time is missing then calculate it from scheduled time and 
+  # scheduled_vs_expectd difference from last known value
+  mutate(expected_hms_temp = as.numeric(schedule_hms_round + hms(scheduled_vs_expected)),
+         expected_hms = coalesce(expected_hms, expected_hms_temp)) %>% 
+  select(-expected_hms_temp) 
+
+glimpse(tram_timetable_arrival)
+```
+
+Remove anomalities:
+ * if one timestamp is different from previous and next timestam more than 900sec, then use previous timestamp and corresponding scheduled vs expected arrival time differenece
+ * in case of first and last stop compare only with next or previous timestamp and correct with previous or next value
+ * if scheduled vs expected arrival time differenece is different more than 300sec from previous and next time difference, then also correct timestamp and time difference value with previous or next actual value.
+```{r}
+tram_timetable_arrival_fixed <- tram_timetable_arrival %>% 
+  group_by(url) %>%
+  # add special feature for first and last stop
+  mutate(feature = ifelse(row_number() == max(row_number()), "last",
+                          ifelse(row_number() == min(row_number()), "first", NA))) %>% 
+  group_by(url) %>% 
+  # calculate timestamp and sched_vs_expect difference with previous and next value
+  # use previously calculated features to decide wether value is anomality 
+  mutate(timestamp_diff_lag = timestamp - lag(timestamp),
+         timestamp_diff_lead = timestamp - lead(timestamp),
+         sched_vs_expect_lag = scheduled_vs_expected - lag(scheduled_vs_expected),
+         sched_vs_expect_lead = scheduled_vs_expected - lead(scheduled_vs_expected),
+         difference = ifelse(((timestamp_diff_lag > 900 | timestamp_diff_lag < -900) & 
+                         (timestamp_diff_lead > 900 | timestamp_diff_lead < -900)) |
+                         (feature == "first" & (timestamp_diff_lead > 900 | timestamp_diff_lead < -900)) |
+                         (feature == "last" & (timestamp_diff_lag > 900 | timestamp_diff_lag < -900)) |
+                         ((sched_vs_expect_lag > 300 | sched_vs_expect_lag < -300) & 
+                         (sched_vs_expect_lead > 300 | sched_vs_expect_lead < -300)) |
+                         (feature == "first" & (sched_vs_expect_lead > 600 | sched_vs_expect_lead < -600)) |
+                         (feature == "last" & (sched_vs_expect_lag > 600 | sched_vs_expect_lag < -600)), 1, NA)) %>%
+  ungroup() %>% 
+  # remove timestamp, scheduled_vs_expected and expected_hms values for anomal rows
+  mutate(timestamp = ifelse(is.na(difference), timestamp, NA),
+         scheduled_vs_expected = ifelse(is.na(difference), scheduled_vs_expected, NA),
+         expected_hms = ifelse(is.na(difference), expected_hms, NA)) %>% 
+  # fill missin timestamp and scheduled_vs_expected columns based on last known value
+  group_by(url) %>% 
+  fill(timestamp, scheduled_vs_expected) %>% 
+  group_by(url) %>% 
+  # fill missin timestamp and scheduled_vs_expected columns based on next known value
+  fill(timestamp, scheduled_vs_expected, .direction = "up") %>% 
+  ungroup() %>% 
+  # if expected time is missing then calculate it from scheduled time and 
+  # scheduled_vs_expectd difference from last known value
+  mutate(expected_hms_temp = as.numeric(schedule_hms_round + hms(scheduled_vs_expected)),
+         expected_hms = coalesce(expected_hms, expected_hms_temp)) %>% 
+  select(-expected_hms_temp, -timestamp_diff_lag, -timestamp_diff_lead, -sched_vs_expect_lag,
+         -sched_vs_expect_lead, -feature, -difference) %>% 
+  # format correctly timestamp and expected_hms
+  mutate(timestamp = as.POSIXct(timestamp, origin = "1970-01-01"),
+         expected_hms = as.hms(expected_hms))
+
+glimpse(tram_timetable_arrival_fixed)
+```
+
+Fix column names for tram stops SF dataframe
+```{r}
+tram_stops_sf_fixed <- tram_stops_sf %>% 
+  rename(last_stop = stop_name, 
+         stop = Name,
+         stop_id = SiriID) %>% 
+  mutate(stop = as.character(stop)) %>% 
+  select(-url)
+```
+
+
+## Prepare tram lines sf object
+
+Remove depo lines from tram lines sf object
+```{r}
+# remove manually tram lines in depos
+tram_lines_no_depo <- mapview(tram_lines) %>% 
+  editMap("tram_lines")
+
+# Estonian projection
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+# Create a buffer from manually deletd objects
+tram_lines_depo_buffer <- tram_lines_depo$deleted %>% 
+  st_transform(., crs = eesti_proj4) %>% 
+  st_buffer(., dist = 10)
+
+# tram lines objects, that are within depo buffer
+tram_lines_in_depo_buffer <- st_contains(tram_lines_depo_buffer, tram_lines_sf %>% st_transform(., crs = eesti_proj4))
+
+# get row numbers of deleted depo lines
+depo_row_numbers <- map_df(seq(1, length(tram_lines_in_depo_buffer), by = 1), 
+                          function(x){as.tibble(t[[x]])}) %>% 
+  distinct(value) %>% 
+  pull(value)
+
+# exclude depo lines from sf object
+tram_lines_no_depo <- tram_lines_sf %>% 
+  filter(!row_number() %in% depo_row_numbers)
+
+mapview(tram_lines_no_depo)
+```
+
+Chane projection of tram lines sf objects to the same as tram stops sf object
+```{r}
+tram_lines_sf <- st_transform(tram_lines_no_depo, crs = sf::st_crs(tram_stops_sf))
+```
+
+PLot on leaflet map tram lines with stops
+```{r}
+leaflet() %>% 
+  addProviderTiles("CartoDB.DarkMatterNoLabels", group = "CartoDB") %>% 
+  # addCircleMarkers()
+  addPolylines(data = tram_lines_sf,
+               color = "orange") %>% 
+  addCircles(data = e %>% st_transform(., crs= st_crs(tram_lines_sf)),
+             color = "red",
+             fillOpacity = 1, 
+             radius = 50)
+```
+
+
+Test how to split tram lines from each stop
+Unsucessfull!
+```{r}
+library(lwgeom)
+
+e <- tram_stops_sf %>% 
+  distinct(Name, .keep_all = TRUE) %>% 
+  st_transform(., crs = eesti_proj4)
+
+e_buffer <- st_buffer(e, dist = 20)
+
+u <- tram_lines_sf %>% 
+             st_transform(., crs = eesti_proj4) %>% 
+             st_combine() %>% 
+  st_union()
+    st_cast(., "LINESTRING") %>% 
+
+  st_split(., st_sfc(st_point(c(24.67335, 59.45904)))) %>% 
+  st_collection_extract(., "LINESTRING") %>% 
+  mapview()
+
+st_crosses()           
+           
+%>% 
+  st_split(., tram_lines_sf %>% 
+             st_transform(., crs = eesti_proj4) %>% 
+             st_combine() %>% 
+             st_collection_extract(., "LINESTRING"))
+
+mapview(tram_lines_sf)
+
+sf::st
+
+?st_split
+
+mls_pts <- tram_lines_sf %>%
+  st_cast(., "POINT")
+  lapply(., function(x) {
+    st_sfc(x) %>% 
+      st_cast(., 'POINT')})
+```
+
+
+## Save results
+
+Save results for exploratory analysis
+```{r}
+save(tram_timetable_arrival_fixed, tram_stops_sf_fixed, file = "data/tram_arrival.rData")
+```
+

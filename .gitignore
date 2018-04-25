@@ -1,0 +1,9 @@
+.Rproj.user
+.Rhistory
+*.RData
+*.rData
+*.rds
+.Ruserdata
+data/
+*.html
+*credentials*

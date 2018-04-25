@@ -1,0 +1,166 @@
+---
+layout: post
+---
+
+
+```{r setup, message=FALSE, warning=FALSE, echo=FALSE}
+# load packages and pre process data
+library(tidyverse)
+library(hms)
+library(lubridate)
+library(hrbrthemes)
+library(plotly)
+
+load("data/tram_arrival.rData")
+
+# Add first stop to every tram ride 
+tram_timetable_arrival <- tram_timetable_arrival_fixed %>% 
+  # add date to correctly arrange rides that occure close to 00:00
+  mutate(schedule_hms_round_nr = as.numeric(schedule_hms_round),
+         # if hours after 00:00, and before 04.00, then date 17.04, else 16.04
+         date = if_else(schedule_hms_round_nr < 15000, ymd("2018.04.17"), ymd("2018.04.16"))) %>% 
+  select(-schedule_hms_round_nr) %>% 
+  arrange(url, date, schedule_hms_round) %>% 
+  group_by(url) %>%
+  # add special feature for first stop
+  mutate(first_stop = ifelse(row_number() == min(row_number()), stop, NA)) %>% 
+  fill(first_stop) %>% 
+  ungroup() %>% 
+  # time difference between scheduled and expected arrival time in minutes
+  mutate(scheduled_vs_expected_min = scheduled_vs_expected / 60,
+         # add tram id (route_num_first_stop_last_stop)
+         tram_id = str_c(route_num, ": ", first_stop, " - ", last_stop))
+```
+
+### {.tabset .tabset-fade}
+
+```{r actual_vs_scheduled_prep, message=FALSE, warning=FALSE, echo=FALSE}
+# prepare data and write a function to plot every tram ride
+
+# tram rides after 00:00 and before 02:00
+# use list to remove them, as they mix up the plot
+late_rides_filter <- tram_timetable_arrival %>% 
+  filter(schedule_hms_round < as.hms("02:00:00") | expected_hms < as.hms("02:00:00")) %>% 
+  distinct(url) %>% 
+  pull(url)
+
+# last stop arrival time for every tram ride
+tram_arrival_distribution <- tram_timetable_arrival %>% 
+  filter(stop == last_stop) 
+
+# if tram arrives to the last stop more than 2 minutes late, then "late", if more then 2 minutes early, then "early", othervise "on time"
+# use categories to color lines on chart
+late_arrival <- tram_arrival_distribution %>%
+  group_by(tram_id) %>%
+  mutate(late_early = ifelse(scheduled_vs_expected_min > 2, "late",
+                             ifelse(scheduled_vs_expected_min < -2, "early", "on time"))) %>%
+  ungroup() %>%
+  select(url, late_early)
+
+# prepare data for ploting
+arrival_data_chart_raw <- tram_timetable_arrival %>% 
+  # add feature "late", "early" or "on time" for every ride
+  left_join(late_arrival, by = "url") %>%
+  # remove rides after 00:00
+  filter(!url %in% late_rides_filter) %>% 
+  ungroup() %>%
+  # rename some columns for plotting
+  rename(stop_name = stop,
+         scheduled_arrival = schedule_hms_round,
+         actual_arrival = expected_hms)
+
+# Create a function to plot all rides for selected tram line
+plot_tram_arrival <- function(tram_nr = "1"){
+  
+  # only rides for selected tram line
+  arrival_data_chart <- arrival_data_chart_raw %>% 
+    filter(str_detect(tram_id, tram_nr))
+  
+  # find stops that cause more than 2 minutes of delay
+  delay_reason <- arrival_data_chart %>%
+    group_by(url) %>%
+    # find delay in minutes that a ride between two stops has caused
+    mutate(delay_cum = scheduled_vs_expected_min - lag(scheduled_vs_expected_min),
+           # label those with more than 2 min delay or if the delay is at the first stop already more than 2 min
+           delay_reason = ifelse(coalesce(delay_cum, scheduled_vs_expected_min) > 2, 1, NA)) %>%
+    filter(delay_reason == 1) %>%
+    ungroup()
+  
+  # plot every ride for selected tram number
+  arrival_chart <- arrival_data_chart %>%
+    ggplot(aes(drlib::reorder_within(stop_name, scheduled_arrival, tram_id),  # reorder stops
+               actual_arrival, group = url, color = late_early,
+               # popup text
+               text = paste("stop name: ", stop_name,
+                            '\nscheduled arrival time: ', str_sub(as.character(scheduled_arrival), start = 0, end = 5),
+                            "\nactual arrival time: ", str_sub(as.character(actual_arrival), start = 0, end = 5)))) +
+    geom_line() +
+    # points for exact stops where delays (>2min) happen
+    geom_point(data = delay_reason, 
+               aes(drlib::reorder_within(stop_name, scheduled_arrival, tram_id),  # reorder stop names
+               actual_arrival, group = url), color = "red") +
+    # colors for "late", "early" and "on time" rides
+    scale_color_manual(values = c("early" = "blue", "late" = "red", "on time" = "grey35")) +
+    # format y scale
+    scale_y_reverse(breaks = seq(0, 3600 * 24, 3600),
+                    labels = function(x) str_c(hour(as.hms(x)), ":", minute(as.hms(x)), "0")) +
+    # custom theme
+    theme_ipsum_rc() +
+    # group by tram_id
+    facet_wrap(~ tram_id, ncol = 6, scales = "free_x") +
+    theme(panel.grid.major = element_line(colour = "#f0f0f0"),
+          axis.text.x = element_blank(),  # no x axis labels
+          axis.title.x = element_blank(),  # no x axis title
+          legend.position = "top",
+          legend.title = element_blank()) +  # no title for legend
+    labs(title = str_c("Tram number ", tram_nr, ": every trip on 16.04.2018"))
+  
+  # generate interactive plotly chart
+  ggplotly(arrival_chart, 
+           height = 1500, width = 1000,  # chart size
+           tooltip = c("text")) %>%  # tooltip text
+    # format legend position
+    layout(legend = list(orientation = "h", x = 0.35, y = 1.04))
+}
+```
+
+#### Tram number 1 
+<br>
+What's really interesting on this chart is a delay that started around 14:30 between Hobujaama and Tallinna Ülikool stop and affected in total 4 trams. The delayed time accumulated again on the same place on the trip back to Kopli. All together the delays affected those trams for about 2 hours and 4 trips. 
+
+On the rush hour there seems to be no special delays. For some reason 5 trams are late to the stop J. Poska in the very beginning of the trip after 18:00. They all make up the delay during the rest of the ride, but for the first half of their trip they are late to every stop.
+
+```{r tram_1, echo=FALSE}
+plot_tram_arrival("1")
+```
+
+#### Tram number 2 
+<br>
+Tram number 2 has by far the most rides that arrive too early to stops. Trams arriving too early could be even more frustrating than trams being late a little bit. People who schedule their rides with timetables could easily miss those rides. Fortunately it seems, that most of the early arrivals happen at the end of each trip and therefor don't affect so many people.
+
+```{r tram_2, echo=FALSE}
+plot_tram_arrival("2")
+```
+
+#### Tram number 3
+<br>
+From 11:30 - 13:30 almost all the trams leaving from Tondi to Kadriorg (10 in total) are late ~10 minutes. The delays are caused in the sections before Tallinn-Väike and Vineeri stop. The accumulated late arrivals carry on with the trams up to 16:00. 3 trams leaving Kadriorg are late around 18:00 (as were 4 trams number 1), but all in all the rush hour tram rides are quite on time.
+
+```{r tram_3, echo=FALSE}
+plot_tram_arrival("3")
+```
+
+#### Tram number 4
+<br>
+The patter of delays for tram number 4 are quite similar to tram number 3. As the two trams share the same route from Tondi to Hobujaama stop, major delays for tram number 4 are also happening before Vineeri stop from 12:00 - 13:00. Actually this place for delays is quite weird, as the tram line is separated from driveway over there. Possibly there was a car crash, that affected all the trams between Tallinn-Väike and Vineeri stop. Rush hour arrivals around 17:00 are on time.
+
+```{r tram_4, echo=FALSE}
+plot_tram_arrival("4")
+```
+
+
+### Further analysis
+
+To make some more solid conclusions on the tram delays, it is definitely necessary to collect data for more than one day and to use a longer period of time to choose the data collection days from. It would also be very interesting to do a similar analysis on buses delays, as they are probably much more affected by the overall traffic (separated bus lines are only in city center and on some major roads).
+
+<br>

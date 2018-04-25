@@ -1,0 +1,297 @@
+---
+title: "Get public transportation data"
+output: html_notebook
+---
+
+Get all nessecary data for public transportation:
+ * all stops in Tallinn
+ * identify tram stops
+ * do API call for tram arrival info in stops
+
+```{r}
+library(sf)
+library(tidyverse)
+library(httr)
+library(rvest)
+library(seleniumPipes)
+library(osmdata)
+```
+
+## Public transportation stops data
+
+Download public transportation stops in Tallinn with stop id (for API calls)
+As the data is in some weird java script format some manual formatting is necessary (add quotes to all keywords: type, coordinates etc)
+Source data is form a website: https://gis.ee/tallinn/
+```{r}
+download.file("https://gis.ee/tallinn/peatused.js?ver=2017-09-18T2314", "data/peatused_raw.txt")
+```
+
+Read public transportation stops data as a sf object and plot it
+```{r}
+peatused <- st_read("data/peatused.txt")
+
+mapview::mapview(peatused)
+```
+
+
+## API call for every stop
+
+Generate url for every stop to ma API calls
+```{r}
+all_stop_id_url <- peatused %>% 
+  as.tibble() %>% 
+  select(id = SiriID) %>% 
+  distinct(id) %>% 
+  mutate(api_url = str_c("https://transport.tallinn.ee/siri-stop-departures.php?stopid=", id))
+```
+
+Function to download API call information for a given stop url
+```{r}
+read_csv_char <- function(x){
+  raw <- read_csv(x, col_types = "cccccc",
+                  col_names = c("transport", "route_num", "expected_time_in_seconds",
+                  "schedule_time_in_seconds", "stop_name", "empty"))
+  raw %>%
+    select(-empty) %>%
+    filter(!transport %in% c("stop", "Transport")) %>% 
+    mutate(url = x)
+}
+
+# ignore errors
+read_csv_char_possibly <- possibly(read_csv_char, NULL)
+```
+
+Make the API call for all public transportation stops.
+It is necessary to identify all tram stops.
+```{r, warning=FALSE, message=FALSE}
+all_stops_raw <- map_df(all_stop_id_url$api_url, read_csv_char_possibly)
+```
+
+Filter only tram stops
+```{r}
+tram_stops <- all_stops_raw %>%
+  filter(transport == "tram") %>% 
+  distinct(url, stop_name) %>% 
+  left_join(all_stop_id_url, by = c("url" = "api_url"))
+```
+
+Tram stops as a sf object with coordinates and visualized on a map
+```{r}
+tram_stops_sf <- peatused %>% 
+  inner_join(tram_stops, by = c("SiriID" = "id")) 
+
+tram_stops_sf %>% 
+  mapview::mapview()
+```
+
+Add calculated fields to tram arrival data.
+Also test data with realtime gps data in https://gis.ee/tallinn/
+```{r}
+all_stops_raw %>%
+  filter(transport == "tram") %>% 
+  mutate(late = as.numeric(expected_time_in_seconds) - as.numeric(schedule_time_in_seconds),
+         expected_hms = hms::as.hms(as.numeric(expected_time_in_seconds)),
+         schedule_hms = hms::as.hms(as.numeric(schedule_time_in_seconds))) %>% 
+  left_join(all_stop_id_url, by = c("url" = "api_url")) %>% 
+  left_join(peatused %>% as.tibble(), by = c("id" = "SiriID")) %>% 
+  filter(Name == "L. Koidula",
+         route_num == 1)
+
+  # filter(late == -629)
+  # count(late, sort = TRUE) %>% 
+  # arrange(late)
+  ggplot(aes(late)) +
+  geom_histogram(binwidth = 10) +
+  coord_cartesian(xlim = c(-500, 500))
+
+```
+
+Save tram stops 
+```{r}
+tram_stops %>% 
+  select(url) %>% 
+  saveRDS("data/tram_stops.rds")
+```
+
+Save additional data
+```{r}
+save(tram_stops, tram_stops_sf, peatused, all_stop_id_url, all_stops_raw,
+     file = "data/arrival_data.RData")
+```
+
+
+Test snapshot call for all tram stops
+```{r, warning=FALSE, message=FALSE}
+system.time(
+ tram_test_1 <- map_df(tram_stops_sf$url, read_csv_char_possibly) 
+)
+```
+
+```{r}
+t <- readRDS("data/arrival/1523873762.rds")
+
+load("data/arrival_data.RData")
+```
+
+
+```{r}
+t %>%
+  mutate(late = as.numeric(expected_time_in_seconds) - as.numeric(schedule_time_in_seconds),
+         expected_hms = hms::as.hms(as.numeric(expected_time_in_seconds)),
+         schedule_hms = hms::as.hms(as.numeric(schedule_time_in_seconds))) %>% 
+  left_join(all_stop_id_url, by = c("url" = "api_url")) %>% 
+  left_join(peatused %>% as.tibble(), by = c("id" = "SiriID")) %>% 
+  arrange(desc(late))
+  filter(Name == "L. Koidula",
+         route_num == 1)
+
+  # filter(late == -629)
+  # count(late, sort = TRUE) %>% 
+  # arrange(late)
+  ggplot(aes(late)) +
+  geom_histogram(binwidth = 10) +
+  coord_cartesian(xlim = c(-500, 500))
+```
+
+## Query tram timetable data
+
+Url for every tram line timetable
+```{r}
+timetable_url <- c(
+  "https://transport.tallinn.ee/#tram/1/a-b",
+  "https://transport.tallinn.ee/#tram/1/b-a",
+  "https://transport.tallinn.ee/#tram/2/a-b",
+  "https://transport.tallinn.ee/#tram/2/b-a",
+  "https://transport.tallinn.ee/#tram/3/a-b",
+  "https://transport.tallinn.ee/#tram/3/b-a",
+  "https://transport.tallinn.ee/#tram/4/a-b",
+  "https://transport.tallinn.ee/#tram/4/b-a"
+)
+```
+
+
+Esmalt tuleb Ubuntu puhul käivitada Seleniumi server läbi shelli kahe käsurea:
+
+$ sudo docker run -d -p 4445:4444 selenium/standalone-firefox
+$ sudo docker ps
+
+Seleniumi serveri sulgemiseks (käsurea lõpus olev nr on Container ID, mille saab käivituse käsust $ sudo docker ps):
+$ sudo docker stop 7e8466a91673
+
+Seejärel saab ühenduse üles ning alustada veebilehe kraapimist.
+
+Create Selenium connection
+```{r}
+remDr <- remoteDr(port = 4445L)
+```
+
+Stop Selenium connection
+```{r}
+# remDr %>%
+#   deleteSession()
+```
+
+Function to get page source for each tram line to extract href to timetable
+```{r}
+get_timetable_href <- function(x){
+  # pause for 0.5-1.5 sec
+  Sys.sleep(runif(1, 0.5, 1.5))
+  
+  page_timetable <- remDr %>% 
+    go(x) %>% 
+    getPageSource()
+  
+  page_timetable %>% 
+    html_nodes(".days-12345 a") %>%
+    html_attr("href") %>% 
+    str_c("https://transport.tallinn.ee/", .) %>% 
+    as.tibble() %>% 
+    rename(url = value)
+}
+
+# ignore errors
+get_timetable_href_possibly <- possibly(get_timetable_href, NULL)
+```
+
+Query all tram lines timetable url
+```{r}
+tram_line_timetable_url <- map_df(timetable_url, get_timetable_href_possibly)
+```
+
+Function to query info for every tramline and every stop timetable
+```{r}
+get_tram_timetable <- function(x){
+  # pause for 0.5-1.5 sec
+  Sys.sleep(runif(1, 0.5, 1.5))
+  
+  timetable_raw <- remDr %>% 
+    go(x) %>% 
+    getPageSource() %>% 
+    html_node("#dlDirStops1") %>%
+    html_nodes(".hover") %>% 
+    html_text()
+  
+  timetable <- tibble(time_stop = timetable_raw, url = x)
+  
+  return(timetable)
+}
+
+get_tram_timetable_possibly <- possibly(get_tram_timetable, NULL)
+```
+
+Get timetables for every tramline and every stop
+```{r}
+system.time(
+  tram_timetable_raw <- map_df(tram_line_timetable_url$url, get_tram_timetable_possibly)
+)
+```
+
+Extract time, stop and tram line info from raw data
+```{r}
+tram_timetable_processed <- tram_timetable_raw %>% 
+  mutate(time = str_extract(time_stop, "[[:digit:]]{1,2}:[[:digit:]]{1,2}"),
+         stop = str_squish(str_replace_all(time_stop, time, "")),
+         route_num = str_extract(url, "(?<=#tram/)[[:digit:]]"))
+
+tram_timetable_processed
+```
+
+Add last stop to every tram route
+```{r}
+tram_direction <- tram_timetable_processed %>% 
+  group_by(url) %>% 
+  filter(row_number() == max(row_number())) %>% 
+  select(url, last_stop = stop)
+
+tram_timetable <- tram_timetable_processed %>% 
+  left_join(tram_direction, by = "url") %>% 
+  select(route_num, stop, last_stop, time, url)
+```
+
+Save tram timetable
+```{r}
+save(tram_timetable, file = "data/tram_timetable.rData")
+```
+
+## Query tram lines sf object
+
+Query tram lines from OSM
+```{r}
+# Estonian projection
+eesti_proj4 <- "+proj=lcc +lat_1=59.33333333333334 +lat_2=58 +lat_0=57.51755393055556 +lon_0=24 +x_0=500000 +y_0=6375000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs"
+
+tram_lines <- getbb("tallinn") %>%
+  opq() %>%
+  add_osm_feature("railway", value = "tram") %>% 
+  osmdata_sf() %>%
+  .$osm_lines %>% 
+  st_transform(., crs = eesti_proj4)
+
+mapview::mapview(tram_lines)
+```
+
+Save tram lines sf object
+```{r}
+save(tram_lines, file = "data/tram_lines_sf.rData")
+```
+
